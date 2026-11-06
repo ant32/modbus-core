@@ -25,37 +25,40 @@ pub fn decode_response(buf: &[u8]) -> Result<Option<(ResponseAdu<'_>, FrameLocat
     if buf.is_empty() {
         return Ok(None);
     }
-    decode(DecoderType::Response, buf)
-        .and_then(|frame| {
-            let Some((DecodedFrame { slave, pdu }, frame_location)) = frame else {
-                return Ok(None);
-            };
-            let hdr = Header { slave };
-            // Decoding of the PDU should are unlikely to fail due
-            // to transmission errors, because the frame's bytes
-            // have already been verified with the CRC.
-
-            let response = ExceptionResponse::try_from(pdu)
-                .map(|er| ResponsePdu(Err(er)))
-                .or_else(|_| Response::try_from(pdu).map(|r| ResponsePdu(Ok(r))))
-                .map(|pdu| Some((ResponseAdu { hdr, pdu }, frame_location)));
-            #[cfg(feature = "log")]
-            if let Err(error) = response {
-                // Unrecoverable error
-                log::error!("Failed to decode Response PDU: {error}");
-            }
-            response
-        })
-        .map_err(|_| {
-            // Decoding the transport frame is non-destructive and must
-            // never fail!
-            unreachable!();
-        })
+    decode(DecoderType::Response, buf).and_then(|frame| {
+        let Some((DecodedFrame { slave, pdu }, frame_location)) = frame else {
+            return Ok(None);
+        };
+        let hdr = Header { slave };
+        // A valid CRC does not guarantee a valid PDU. Select the parser by
+        // the exception bit so an invalid exception is not retried as a
+        // normal (potentially custom) response, losing the original error.
+        let response = if pdu[0] & 0x80 != 0 {
+            ExceptionResponse::try_from(pdu).map(|er| ResponsePdu(Err(er)))
+        } else {
+            Response::try_from(pdu).map(|r| ResponsePdu(Ok(r)))
+        }
+        .map(|pdu| Some((ResponseAdu { hdr, pdu }, frame_location)));
+        #[cfg(feature = "log")]
+        if let Err(error) = response {
+            log::error!("Failed to decode Response PDU: {error}");
+        }
+        response
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_unknown_exception_code() {
+        let mut rsp = [0x12, 0x83, 0x07, 0, 0];
+        let crc = crc16(&rsp[..3]);
+        BigEndian::write_u16(&mut rsp[3..], crc);
+
+        assert_eq!(decode_response(&rsp), Err(Error::ExceptionCode(0x07)));
+    }
 
     #[test]
     fn decode_empty_response() {
